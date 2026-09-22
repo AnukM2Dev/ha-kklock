@@ -57,8 +57,6 @@ class KKHomeAuthError(KKHomeApiError):
 
 @dataclass(slots=True)
 class KKHomeLockDevice:
-    """Normalized lock device model."""
-
     device_id: str
     name: str
     is_locked: bool | None
@@ -67,13 +65,13 @@ class KKHomeLockDevice:
 
 
 class KKHomeApiClient:
-    """Cloud client for KK Home."""
-
     def __init__(self, hass, config: dict[str, Any]) -> None:
         self._hass = hass
         self._client = get_async_client(hass)
         self._config = config
-        self._token: str | None = config.get(CONF_ACCESS_TOKEN)
+        self._token: str | None = config.get(CONF_ACCESS_TOKEN) or None
+        if self._token == "":
+            self._token = None
         self._token_expires_at = self._decode_token_expiration(self._token)
         self._private_key = serialization.load_der_private_key(_APP_PRIVATE_KEY, password=None)
         self._public_key = serialization.load_der_public_key(_SERVICE_PUBLIC_KEY)
@@ -117,6 +115,7 @@ class KKHomeApiClient:
             if not token:
                 raise KKHomeAuthError("Login succeeded but no token was found in the response.")
             self._set_token(token)
+            _LOGGER.debug("KK Home login ok; token length=%s", len(token))
 
     async def async_test_connection(self) -> None:
         await self.async_authenticate()
@@ -124,7 +123,11 @@ class KKHomeApiClient:
 
     async def async_get_locks(self) -> list[KKHomeLockDevice]:
         await self.async_authenticate()
-        payload = await self._request("post", self._config[CONF_DEVICES_PATH])
+        payload = await self._request(
+            "post",
+            self._config[CONF_DEVICES_PATH],
+            json_body=self._sign_payload({}),
+        )
         devices = self._extract_devices(payload)
         locks: list[KKHomeLockDevice] = []
         for device in devices:
@@ -137,38 +140,29 @@ class KKHomeApiClient:
         return locks
 
     async def async_lock(self, device: KKHomeLockDevice) -> None:
-        payload = self._command_payload(device)
         await self._request(
             "post",
             self._config[CONF_LOCK_PATH],
-            json_body=self._encrypt_payload(payload),
+            json_body=self._encrypt_payload(self._command_payload(device)),
             headers={_ENCRYPT_DATA_HEADER: _ENCRYPT_DATA_HEADER},
         )
         self._remember_command_state(device.device_id, True)
 
     async def async_unlock(self, device: KKHomeLockDevice) -> None:
-        payload = self._command_payload(device)
         await self._request(
             "post",
             self._config[CONF_UNLOCK_PATH],
-            json_body=self._encrypt_payload(payload),
+            json_body=self._encrypt_payload(self._command_payload(device)),
             headers={_ENCRYPT_DATA_HEADER: _ENCRYPT_DATA_HEADER},
         )
         self._remember_command_state(device.device_id, False)
 
     async def async_get_open_status(self, device: KKHomeLockDevice) -> Any:
+        body = self._sign_payload({"esn": self._device_esn(device)})
         try:
-            return await self._request(
-                "post",
-                self._config[CONF_DEVICE_DETAIL_PATH],
-                json_body=self._sign_payload({"esn": self._device_esn(device)}),
-            )
+            return await self._request("post", self._config[CONF_DEVICE_DETAIL_PATH], json_body=body)
         except KKHomeApiError:
-            return await self._request(
-                "post",
-                self._config[CONF_STATUS_PATH],
-                json_body=self._sign_payload({"esn": self._device_esn(device)}),
-            )
+            return await self._request("post", self._config[CONF_STATUS_PATH], json_body=body)
 
     async def _request(
         self,
@@ -212,15 +206,20 @@ class KKHomeApiClient:
         if isinstance(parsed, dict) and "encryptData" in parsed:
             parsed = self._decrypt_response(parsed["encryptData"])
 
-        if response.status_code in (401, 403):
+        if response.status_code in (401, 403) or (
+            isinstance(parsed, dict) and self._response_needs_reauthentication(parsed)
+        ):
             if not allow_unauthenticated and retry_on_auth_failure and self._credentials_available():
+                _LOGGER.warning("KK Home session rejected for %s; retrying login", url)
                 self._clear_token()
                 await self.async_authenticate()
                 return await self._request(
                     method, path, params=params, json_body=json_body, headers=headers,
-                    allow_unauthenticated=allow_unauthenticated, retry_on_auth_failure=False,
+                    allow_unauthenticated=False, retry_on_auth_failure=False,
                 )
-            raise KKHomeAuthError(f"Authentication failed for {url}: HTTP {response.status_code}")
+            raise KKHomeAuthError(
+                (parsed.get("msg") if isinstance(parsed, dict) else None) or "Not logged in"
+            )
         if response.status_code >= 400:
             raise KKHomeApiError(f"Request failed for {url}: HTTP {response.status_code}: {text}")
 
@@ -337,12 +336,12 @@ class KKHomeApiClient:
         return desired_locked
 
     def _find_token(self, payload: Any) -> str | None:
-        if isinstance(payload, str):
+        if isinstance(payload, str) and payload.count(".") >= 2:
             return payload
         if isinstance(payload, dict):
             for key in ("accessToken", "access_token", "token", "bearerToken"):
                 value = payload.get(key)
-                if isinstance(value, str) and value:
+                if isinstance(value, str) and value.count(".") >= 2:
                     return value
             for value in payload.values():
                 token = self._find_token(value)
@@ -354,6 +353,13 @@ class KKHomeApiClient:
                 if token:
                     return token
         return None
+
+    def _response_needs_reauthentication(self, payload: dict[str, Any]) -> bool:
+        code = str(payload.get("code", "")).strip()
+        if code in {"401", "403", "444"}:
+            return True
+        message = " ".join(str(payload.get(key, "")) for key in ("msg", "message", "error", "detail")).lower()
+        return any(marker in message for marker in ("not logged in", "login expired", "token expired", "invalid token", "unauthorized", "forbidden"))
 
     def _credentials_available(self) -> bool:
         return bool(self._config.get(CONF_USERNAME) and self._config.get(CONF_PASSWORD))
