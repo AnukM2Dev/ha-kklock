@@ -1,0 +1,13 @@
+{
+  "domain": "kkhome",
+  "name": "KK Home",
+  "codeowners": ["@AnukM2Dev"],
+  "config_flow": true,
+  "documentation": "https://github.com/AnukM2Dev/ha-kklock",
+  "integration_type": "hub",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/AnukM2Dev/ha-kklock/issues",
+  "loggers": ["custom_components.kkhome"],
+  "requirements": ["bleak>=0.22.3"],
+  "version": "0.2.0"
+}
