@@ -125,11 +125,30 @@ class KKHomeApiClient:
 
     async def async_get_locks(self) -> list[KKHomeLockDevice]:
         await self.async_authenticate()
-        payload = await self._request(
-            "post",
-            self._config[CONF_DEVICES_PATH],
-            json_body=self._sign_payload({}),
+        path = self._config[CONF_DEVICES_PATH]
+        last_error: Exception | None = None
+        payload: Any = None
+        attempts = (
+            ("no-body", None, None),
+            ("signed-page", self._sign_payload({"pageNum": 1, "pageSize": 50}), None),
+            ("signed-empty", self._sign_payload({}), None),
+            ("encrypted-empty", self._encrypt_payload({}), {_ENCRYPT_DATA_HEADER: _ENCRYPT_DATA_HEADER}),
         )
+        for label, body, extra_headers in attempts:
+            try:
+                kwargs: dict[str, Any] = {}
+                if body is not None:
+                    kwargs["json_body"] = body
+                if extra_headers:
+                    kwargs["headers"] = extra_headers
+                payload = await self._request("post", path, **kwargs)
+                _LOGGER.warning("KK Home device list succeeded via %s", label)
+                break
+            except KKHomeApiError as err:
+                last_error = err
+                _LOGGER.warning("KK Home device list %s failed: %s", label, err)
+        else:
+            raise last_error or KKHomeApiError("Device list failed")
         devices = self._extract_devices(payload)
         locks = []
         for device in devices:
